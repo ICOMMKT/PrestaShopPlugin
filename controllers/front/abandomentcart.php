@@ -32,6 +32,13 @@ class IcommktconnectorAbandomentcartModuleFrontController extends ModuleFrontCon
 
     public function init()
     {
+        /* Funcionalidad retirada en la versión 1.3.0: solo sigue disponible en las tiendas
+           que ya la tenían en uso */
+        $module = Module::getInstanceByName('icommktconnector');
+        if (!$module->isAbandonLegacy()) {
+            Tools::redirect('index.php?controller=404');
+        }
+
         parent::init();
 
         $action = Tools::getValue('action');
@@ -40,7 +47,9 @@ class IcommktconnectorAbandomentcartModuleFrontController extends ModuleFrontCon
         $id_cart = Tools::getValue('id_cart');
 
         if (empty($secure_token) || ($secure_token != $secure_token_back)) {
-            $this->errors[] = Tools::displayError('El token no coincide');
+            /* Antes solo se acumulaba el error, pero load_cart redirigía antes de mostrarlo */
+            echo Tools::displayError('El token no coincide');
+            exit();
         }
 
         switch ($action) {

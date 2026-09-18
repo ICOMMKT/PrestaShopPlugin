@@ -22,12 +22,26 @@ class Icommktconnector extends Module
 {
     protected $config_form = false;
 
+    /* Tienda resuelta a partir de la AppKey en authorizeRequest() */
+    public $context_id_shop = null;
+    public $context_id_shop_group = null;
+
+    /* Diagnóstico del endpoint de catálogo (parámetro debug=1) */
+    protected $catalog_debug = false;
+    protected $catalog_debug_sql = null;
+    protected $catalog_debug_row = null;
+
+    const CATALOG_PER_PAGE_DEFAULT = 50;
+    const CATALOG_PER_PAGE_MAX = 200;
+
     public function __construct()
     {
+        /* $this->name es el identificador técnico (carpeta, controladores, BD): no debe cambiar */
         $this->name = 'icommktconnector';
-        $this->tab = 'emailing';
-        $this->version = '1.2.2';
-        $this->author = 'icommkt';
+        /* $this->tab debe ser uno de los identificadores que reconoce PrestaShop */
+        $this->tab = 'advertising_marketing';
+        $this->version = '1.4.4';
+        $this->author = 'icomm';
         $this->need_instance = 0;
 
         /**
@@ -37,16 +51,30 @@ class Icommktconnector extends Module
 
         parent::__construct();
 
-        $this->displayName = $this->l('ICOMMKT Connector');
-        $this->description = $this->l('Enabled API service to connect to ICOMMKT service');
+        $this->displayName = $this->l('icomm AI Marketing Cloud');
+        $this->description = $this->l('Enabled API service for icomm native integration');
     }
 
     public function install()
     {
-        return parent::install() &&
-        $this->installDb() &&
-        $this->addNewColumn() &&
-        $this->registerHook('moduleRoutes');
+        /* Las funcionalidades retiradas (carritos abandonados en 1.3.0, envío de suscriptores de la
+           newsletter en 1.4.0) solo siguen disponibles en las tiendas que ya las usaban. Se detectan
+           en lugar de fijarlas a 0 para no perderlas al reinstalar sobre una tienda que las usaba. */
+        $newsletter_legacy = $this->detectNewsletterLegacy();
+
+        Configuration::updateValue('ICOMMKT_ABANDON_LEGACY', ($this->detectAbandonLegacy() ? 1 : 0));
+        Configuration::updateValue('ICOMMKT_NEWSLETTER_LEGACY', ($newsletter_legacy ? 1 : 0));
+
+        if (!parent::install() || !$this->registerHook('moduleRoutes')) {
+            return false;
+        }
+
+        /* Las instalaciones nuevas no modifican la tabla de suscriptores de PrestaShop */
+        if ($newsletter_legacy) {
+            $this->addNewColumn();
+        }
+
+        return true;
     }
 
     public function uninstall()
@@ -55,49 +83,122 @@ class Icommktconnector extends Module
         return parent::uninstall() && $this->uninstallDb() && $this->uninstallColumns();
     }
 
-    public function installDb()
+    /**
+     * La gestión de carritos abandonados está retirada desde la versión 1.3.0, pero se mantiene operativa
+     * en las tiendas que ya la tenían en uso. El resultado se guarda en configuración para que la
+     * detección se haga una sola vez por tienda.
+     */
+    public function isAbandonLegacy()
     {
-        $sql = Tools::file_get_contents(dirname(__FILE__) . '/install.sql');
-        $sql = str_replace('PREFIX_', _DB_PREFIX_, $sql);
-        $sql = preg_split("/;\s*[\r\n]+/", $sql);
-        foreach ($sql as $query) {
-            Db::getInstance()->Execute($query);
+        $flag = Configuration::get('ICOMMKT_ABANDON_LEGACY');
+
+        if ($flag === false || $flag === '') {
+            $flag = ($this->detectAbandonLegacy() ? 1 : 0);
+            Configuration::updateValue('ICOMMKT_ABANDON_LEGACY', $flag);
         }
-        return true;
+
+        return (bool)$flag;
+    }
+
+    /**
+     * Una tienda se considera usuaria de carritos abandonados si tiene el perfil configurado
+     * o si ya ha enviado carritos a ICOMMKT.
+     */
+    protected function detectAbandonLegacy()
+    {
+        $profile_key = Configuration::get('ICOMMKT_PROFILEKEY_ABANDON');
+        if (!empty($profile_key)) {
+            return true;
+        }
+
+        $table = _DB_PREFIX_ . 'commktconnector_abandomentcarts';
+        $exists = Db::getInstance()->executeS('SHOW TABLES LIKE \'' . pSQL($table) . '\'');
+        if (!$exists) {
+            return false;
+        }
+
+        return (bool)Db::getInstance()->getValue('SELECT COUNT(*) FROM `' . bqSQL($table) . '`');
+    }
+
+    /**
+     * El envío de suscriptores de la newsletter está retirado desde la versión 1.4.0, con el mismo
+     * criterio que los carritos abandonados: sigue operativo donde ya se usaba.
+     */
+    public function isNewsletterLegacy()
+    {
+        $flag = Configuration::get('ICOMMKT_NEWSLETTER_LEGACY');
+
+        if ($flag === false || $flag === '') {
+            $flag = ($this->detectNewsletterLegacy() ? 1 : 0);
+            Configuration::updateValue('ICOMMKT_NEWSLETTER_LEGACY', $flag);
+        }
+
+        return (bool)$flag;
+    }
+
+    /**
+     * Una tienda se considera usuaria del envío de suscriptores si tiene el perfil configurado o si
+     * el módulo ya añadió sus columnas a la tabla de suscriptores de PrestaShop.
+     */
+    protected function detectNewsletterLegacy()
+    {
+        $profile_key = Configuration::get('ICOMMKT_PROFILEKEY');
+        if (!empty($profile_key)) {
+            return true;
+        }
+
+        /* Si la tabla no existe, executeS devuelve false y la tienda no se considera legacy */
+        $columns = Db::getInstance()->executeS(
+            'SHOW COLUMNS FROM `' . bqSQL($this->getNewsletterTable()) . '` LIKE \'is_send_icommkt\''
+        );
+
+        return (bool)$columns;
+    }
+
+    /**
+     * PrestaShop renombró la tabla de suscriptores en la 1.7.
+     */
+    public function getNewsletterTable()
+    {
+        if (Tools::version_compare(_PS_VERSION_, '1.7.0.0', '>=') == true) {
+            return _DB_PREFIX_ . 'emailsubscription';
+        }
+
+        return _DB_PREFIX_ . 'newsletter';
     }
 
     public function addNewColumn()
     {
-        if (Tools::version_compare(_PS_VERSION_, '1.7.0.0', '>=') == true) {
-            $sql  = 'ALTER TABLE ' . _DB_PREFIX_ . 'emailsubscription  ADD COLUMN is_send_icommkt BOOLEAN';
-            $sql2 = 'ALTER TABLE ' . _DB_PREFIX_ . 'emailsubscription  ADD COLUMN date_send_icommkt DATETIME';
-        } else {
-            $sql  = 'ALTER TABLE ' . _DB_PREFIX_ . 'newsletter ADD COLUMN is_send_icommkt BOOLEAN';
-            $sql2 = 'ALTER TABLE ' . _DB_PREFIX_ . 'newsletter ADD COLUMN date_send_icommkt DATETIME';
-        }
-        Db::getInstance()->execute($sql);
-        Db::getInstance()->execute($sql2);
+        $table = $this->getNewsletterTable();
+
+        Db::getInstance()->execute('ALTER TABLE `' . bqSQL($table) . '` ADD COLUMN is_send_icommkt BOOLEAN');
+        Db::getInstance()->execute('ALTER TABLE `' . bqSQL($table) . '` ADD COLUMN date_send_icommkt DATETIME');
+
         return true;
     }
 
     public function uninstallColumns()
     {
-        if (Tools::version_compare(_PS_VERSION_, '1.7.0.0', '>=') == true) {
-            $sql  = 'ALTER TABLE ' . _DB_PREFIX_ . 'emailsubscription  DROP COLUMN is_send_icommkt';
-            $sql2 = 'ALTER TABLE ' . _DB_PREFIX_ . 'emailsubscription  DROP COLUMN date_send_icommkt';
-        } else {
-            $sql  = 'ALTER TABLE ' . _DB_PREFIX_ . 'newsletter DROP COLUMN is_send_icommkt';
-            $sql2 = 'ALTER TABLE ' . _DB_PREFIX_ . 'newsletter DROP COLUMN date_send_icommkt';
+        /* Desde 1.4.0 las instalaciones nuevas no añaden estas columnas, así que no hay nada que quitar */
+        if (!$this->isNewsletterLegacy()) {
+            return true;
         }
-        Db::getInstance()->execute($sql);
-        Db::getInstance()->execute($sql2);
+
+        $table = $this->getNewsletterTable();
+
+        Db::getInstance()->execute('ALTER TABLE `' . bqSQL($table) . '` DROP COLUMN is_send_icommkt');
+        Db::getInstance()->execute('ALTER TABLE `' . bqSQL($table) . '` DROP COLUMN date_send_icommkt');
+
         return true;
     }
 
     public function uninstallDb()
     {
-        Db::getInstance()->Execute('DROP TABLE `' . _DB_PREFIX_ . 'commktconnector_abandomentcarts`');
-        Db::getInstance()->Execute('DROP TABLE `' . _DB_PREFIX_ . 'commktconnector_abandomentcarts_error`');
+        /* IF EXISTS: desde 1.3.0 las instalaciones nuevas ya no crean estas tablas */
+        Db::getInstance()->Execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'commktconnector_abandomentcarts`');
+        Db::getInstance()->Execute(
+            'DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'commktconnector_abandomentcarts_error`'
+        );
 
         return true;
     }
@@ -114,32 +215,22 @@ class Icommktconnector extends Module
             $this->postProcess();
         }
 
-        /* Mostrar en el backoffice las URLs de ejemplo para ejecutar las distintas funciones del módulo */
-        $load_cart_url = $this->getFormattedLink(array(
-            'action' => 'load_cart',
-            'secure_token' => '[secure_token]',
-            'id_cart' => '[id_cart]'
-        ));
-        $send_abandoment_cart_url = $this->getFormattedLink(array(
-            'action' => 'sendAbandomentcarts',
-            'secure_token' => '[secure_token]',
-        ));
-
-        $send_icommkt_user = $this->getFormattedLinkUser(array(
-            'action' => 'sendtoicommktuser',
-            'secure_token' => '[secure_token]',
-        ));
-
+        /* La pantalla de configuración es solo la cabecera con el logo más el formulario de ajustes */
         $this->context->smarty->assign(array(
             'module_dir' => $this->_path,
-            'load_cart_url' => $load_cart_url,
-            'send_abandoment_cart_url' => $send_abandoment_cart_url,
-            'send_icommkt_user' => $send_icommkt_user
+            'module_version' => $this->version,
         ));
 
-        $this->context->smarty->assign('module_dir', $this->_path);
+        $template = $this->local_path . 'views/templates/admin/settings.tpl';
 
-        $output = $this->context->smarty->fetch($this->local_path . 'views/templates/admin/configure.tpl');
+        /* Tras actualizar el módulo, PrestaShop puede seguir sirviendo la versión compilada anterior
+           de la plantilla. Recompilarla aquí es barato, porque esta pantalla se visita muy poco, y
+           evita tener que vaciar la caché de la tienda en cada actualización. */
+        if (method_exists($this->context->smarty, 'clearCompiledTemplate')) {
+            $this->context->smarty->clearCompiledTemplate($template);
+        }
+
+        $output = $this->context->smarty->fetch($template);
 
         return $output . $this->renderForm();
     }
@@ -177,7 +268,7 @@ class Icommktconnector extends Module
      */
     protected function getConfigForm()
     {
-        return array(
+        $form = array(
             'form' => array(
                 'legend' => array(
                     'title' => $this->l('Settings'),
@@ -200,70 +291,89 @@ class Icommktconnector extends Module
                         'name' => 'ICOMMKT_APPTOKEN',
                         'label' => $this->l('App TOKEN'),
                     ),
-                    array(
-                        'col' => 3,
-                        'type' => 'text',
-                        'prefix' => '<i class="icon icon-gear"></i>',
-                        'desc' => $this->l('API KEY code from the account icommkt'),
-                        'name' => 'ICOMMKT_APIKEY',
-                        'label' => $this->l('API Key'),
-                    ),
-                    array(
-                        'col' => 3,
-                        'type' => 'text',
-                        'class' => 'newsletter',
-                        'prefix' => '<i class="icon icon-gear"></i>',
-                        'desc' => $this->l('Code obtained from the account profile'),
-                        'name' => 'ICOMMKT_PROFILEKEY',
-                        'label' => $this->l('Profile Key'),
-                    ),
-                    array(
-                        'col' => 3,
-                        'type' => 'text',
-                        'prefix' => '<i class="icon icon-gear"></i>',
-                        'desc' => $this->l('Profile key code where to send Cart Abandon'),
-                        'name' => 'ICOMMKT_PROFILEKEY_ABANDON',
-                        'label' => $this->l('Profile Key Cart Abandon'),
-                    ),
-                    array(
-                        'col' => 3,
-                        'type' => 'text',
-                        'prefix' => '<i class="icon icon-gear"></i>',
-                        'desc' => $this->l('Required parameter to send the data.Parameter Customizable'),
-                        'name' => 'ICOMMKT_SECURE_TOKEN',
-                        'label' => $this->l('Secure TOKEN'),
-                    ),
-                    array(
-                        'col' => 3,
-                        'type' => 'text',
-                        'prefix' => '<i class="icon icon-gear"></i>',
-                        'desc' => $this->l('Time that goes by to consider an abandoned cart'),
-                        'name' => 'ICOMMKT_DAYS_TO_ABANDON',
-                        'label' => $this->l('Days to abandon'),
-                    ),
-                    array(
-                        'type' => 'radio',
-                        'label' => 'Friendly URL',
-                        'name' => 'ICOMMKT_FRIENDLY_URL',
-                        'values' => array(
-                            array(
-                                'id' => 'active_on',
-                                'value' => 1,
-                                'label' => 'Enabled'
-                            ),
-                            array(
-                                'id' => 'active_off',
-                                'value' => 0,
-                                'label' => 'Disabled'
-                            )
-                        )
-                    )
                 ),
                 'submit' => array(
                     'title' => $this->l('Save'),
                 ),
             ),
         );
+
+        /* API Key y Secure TOKEN solo los usan los crons retirados: sin ninguno de ellos activo
+           no hay nada que autenticar con esos valores */
+        if ($this->isAbandonLegacy() || $this->isNewsletterLegacy()) {
+            $form['form']['input'][] = array(
+                'col' => 3,
+                'type' => 'text',
+                'prefix' => '<i class="icon icon-gear"></i>',
+                'desc' => $this->l('API KEY code from the account icomm'),
+                'name' => 'ICOMMKT_APIKEY',
+                'label' => $this->l('API Key'),
+            );
+            $form['form']['input'][] = array(
+                'col' => 3,
+                'type' => 'text',
+                'prefix' => '<i class="icon icon-gear"></i>',
+                'desc' => $this->l('Required parameter to send the data.Parameter Customizable'),
+                'name' => 'ICOMMKT_SECURE_TOKEN',
+                'label' => $this->l('Secure TOKEN'),
+            );
+        }
+
+        /* Perfil de la newsletter: solo en las tiendas que ya usaban el envío de suscriptores */
+        if ($this->isNewsletterLegacy()) {
+            $form['form']['input'][] = array(
+                'col' => 3,
+                'type' => 'text',
+                'class' => 'newsletter',
+                'prefix' => '<i class="icon icon-gear"></i>',
+                'desc' => $this->l('Code obtained from the account profile'),
+                'name' => 'ICOMMKT_PROFILEKEY',
+                'label' => $this->l('Profile Key'),
+            );
+        }
+
+        /* Campos de carritos abandonados: solo en las tiendas que ya usaban la funcionalidad */
+        if ($this->isAbandonLegacy()) {
+            $legacy_inputs = array(
+                array(
+                    'col' => 3,
+                    'type' => 'text',
+                    'prefix' => '<i class="icon icon-gear"></i>',
+                    'desc' => $this->l('Profile key code where to send Cart Abandon'),
+                    'name' => 'ICOMMKT_PROFILEKEY_ABANDON',
+                    'label' => $this->l('Profile Key Cart Abandon'),
+                ),
+                array(
+                    'col' => 3,
+                    'type' => 'text',
+                    'prefix' => '<i class="icon icon-gear"></i>',
+                    'desc' => $this->l('Time that goes by to consider an abandoned cart'),
+                    'name' => 'ICOMMKT_DAYS_TO_ABANDON',
+                    'label' => $this->l('Days to abandon'),
+                ),
+                array(
+                    'type' => 'radio',
+                    'label' => 'Friendly URL',
+                    'name' => 'ICOMMKT_FRIENDLY_URL',
+                    'values' => array(
+                        array(
+                            'id' => 'active_on',
+                            'value' => 1,
+                            'label' => 'Enabled'
+                        ),
+                        array(
+                            'id' => 'active_off',
+                            'value' => 0,
+                            'label' => 'Disabled'
+                        )
+                    )
+                )
+            );
+
+            $form['form']['input'] = array_merge($form['form']['input'], $legacy_inputs);
+        }
+
+        return $form;
     }
 
     /**
@@ -271,18 +381,31 @@ class Icommktconnector extends Module
      */
     protected function getConfigFormValues()
     {
-        $icommkt_days_to_abandon = Configuration::get('ICOMMKT_DAYS_TO_ABANDON', null);
-
-        return array(
+        $values = array(
             'ICOMMKT_APPKEY' => Configuration::get('ICOMMKT_APPKEY', null),
             'ICOMMKT_APPTOKEN' => Configuration::get('ICOMMKT_APPTOKEN', null),
-            'ICOMMKT_APIKEY' => Configuration::get('ICOMMKT_APIKEY', null),
-            'ICOMMKT_PROFILEKEY' => Configuration::get('ICOMMKT_PROFILEKEY', null),
-            'ICOMMKT_PROFILEKEY_ABANDON' => Configuration::get('ICOMMKT_PROFILEKEY_ABANDON', null),
-            'ICOMMKT_SECURE_TOKEN' => Configuration::get('ICOMMKT_SECURE_TOKEN', null),
-            'ICOMMKT_DAYS_TO_ABANDON' => !empty($icommkt_days_to_abandon) ? $icommkt_days_to_abandon : '1',
-            'ICOMMKT_FRIENDLY_URL' => Configuration::get('ICOMMKT_FRIENDLY_URL', null),
         );
+
+        /* postProcess() recorre este array, así que las claves de las funcionalidades retiradas solo
+           se leen y se guardan en las tiendas que ya las usaban */
+        if ($this->isAbandonLegacy() || $this->isNewsletterLegacy()) {
+            $values['ICOMMKT_APIKEY'] = Configuration::get('ICOMMKT_APIKEY', null);
+            $values['ICOMMKT_SECURE_TOKEN'] = Configuration::get('ICOMMKT_SECURE_TOKEN', null);
+        }
+
+        if ($this->isNewsletterLegacy()) {
+            $values['ICOMMKT_PROFILEKEY'] = Configuration::get('ICOMMKT_PROFILEKEY', null);
+        }
+
+        if ($this->isAbandonLegacy()) {
+            $icommkt_days_to_abandon = Configuration::get('ICOMMKT_DAYS_TO_ABANDON', null);
+
+            $values['ICOMMKT_PROFILEKEY_ABANDON'] = Configuration::get('ICOMMKT_PROFILEKEY_ABANDON', null);
+            $values['ICOMMKT_DAYS_TO_ABANDON'] = !empty($icommkt_days_to_abandon) ? $icommkt_days_to_abandon : '1';
+            $values['ICOMMKT_FRIENDLY_URL'] = Configuration::get('ICOMMKT_FRIENDLY_URL', null);
+        }
+
+        return $values;
     }
 
     /**
@@ -423,9 +546,21 @@ class Icommktconnector extends Module
                     'module' => $this->name
                 ),
             ),
+            'catalog_list_products' => array(
+                //List Products (one row per combination / SKU)
+                'controller' => 'catalog',
+                'keywords' => array(
+                    'id_product' => array('regexp' => '[0-9]+', 'param' => 'id_product'),
+                ),
+                'rule' => 'icommkt/catalog/pvt/products{/:id_product}',
+                'params' => array(
+                    'fc' => 'module',
+                    'module' => $this->name
+                ),
+            ),
         );
 
-        if (Configuration::get('ICOMMKT_FRIENDLY_URL', null) == 1) {
+        if ($this->isAbandonLegacy() && Configuration::get('ICOMMKT_FRIENDLY_URL', null) == 1) {
             $result[$this->name.'-abandomentcart'] = array(
                 //List Orders
                 'controller' => 'abandomentcart',
@@ -442,18 +577,20 @@ class Icommktconnector extends Module
             );
         }
 
-        $result[$this->name.'-send_to_icommkt'] = array(
-            'controller' => 'sendtoicommkt',
-            'keywords' => array(
-                'action' => array('regexp' => '[_a-zA-Z0-9\pL\pS-]*', 'param' => 'action'),
-                'secure_token' => array('regexp' => '[_a-zA-Z0-9\pL\pS-]*', 'param' => 'secure_token'),
-            ),
-            'rule' => 'sendtoicommkt/{action}/{secure_token}',
-            'params' => array(
-                'fc' => 'module',
-                'module' => $this->name
-            ),
-        );
+        if ($this->isNewsletterLegacy()) {
+            $result[$this->name.'-send_to_icommkt'] = array(
+                'controller' => 'sendtoicommkt',
+                'keywords' => array(
+                    'action' => array('regexp' => '[_a-zA-Z0-9\pL\pS-]*', 'param' => 'action'),
+                    'secure_token' => array('regexp' => '[_a-zA-Z0-9\pL\pS-]*', 'param' => 'secure_token'),
+                ),
+                'rule' => 'sendtoicommkt/{action}/{secure_token}',
+                'params' => array(
+                    'fc' => 'module',
+                    'module' => $this->name
+                ),
+            );
+        }
 
         return $result;
     }
@@ -1220,6 +1357,535 @@ class Icommktconnector extends Module
         exit(json_encode($orderStatus));
     }
 
+    /**
+     * REST endpoint: catálogo completo, una fila por SKU real (combinación).
+     *
+     * Parámetros GET:
+     *   page          int    página, base 1 (por defecto 1)
+     *   per_page      int    filas por página (por defecto 50, máximo 200)
+     *   id_product    int    id exacto de producto
+     *   sku           string referencia / EAN / UPC de producto o combinación (coincidencia parcial)
+     *   name          string nombre del producto (coincidencia parcial)
+     *   search        string texto libre: id, referencia, EAN o nombre
+     *   active        int    1 solo activos, 0 solo inactivos, ausente = todos
+     *   updated_since string fecha; filtra por product.date_upd
+     *   orderBy       string "<campo>,<asc|desc>"; campo en {id, reference, name, price, quantity, dateUpdated}
+     *   with_tax      int    1 (por defecto) precios con impuestos, 0 sin impuestos
+     *   id_lang       int    idioma; por defecto el del contexto
+     */
+    public function getProducts()
+    {
+        $id_lang = (int)Tools::getValue('id_lang');
+        if (!$id_lang && Validate::isLoadedObject($this->context->language)) {
+            $id_lang = (int)$this->context->language->id;
+        }
+        if (!$id_lang) {
+            $id_lang = (int)Configuration::get('PS_LANG_DEFAULT');
+        }
+
+        $id_shop = (int)$this->context_id_shop;
+        if (!$id_shop) {
+            $id_shop = (int)$this->context->shop->id;
+        }
+
+        /* El controlador no llama a parent::init(), así que hay que asegurar el contexto
+           del que dependen Product::getPriceStatic() y Link::getProductLink() */
+        if ((int)$this->context->shop->id != $id_shop) {
+            Shop::setContext(Shop::CONTEXT_SHOP, $id_shop);
+            $this->context->shop = new Shop($id_shop);
+        }
+        if (!Validate::isLoadedObject($this->context->country)) {
+            $this->context->country = new Country((int)Configuration::get('PS_COUNTRY_DEFAULT'), $id_lang);
+        }
+        if (!Validate::isLoadedObject($this->context->currency)) {
+            $this->context->currency = new Currency((int)Configuration::get('PS_CURRENCY_DEFAULT'));
+        }
+
+        /* PrestaShop 8 y 9 exigen un carrito o un empleado en el contexto para calcular precios:
+           Product::getPriceStatic() lanza "If no employee is assigned in the context, cart ID must
+           be provided to this method". Una API de lectura no tiene ni cliente ni empleado, así que
+           se prepara un carrito vacío (y un empleado, por si la comprobación cambia de forma). */
+        if (!Validate::isLoadedObject($this->context->cart)) {
+            $cart = new Cart();
+            $cart->id_shop = $id_shop;
+            $cart->id_lang = $id_lang;
+            $cart->id_currency = (int)$this->context->currency->id;
+            $cart->id_customer = 0;
+            $this->context->cart = $cart;
+        }
+        if (!isset($this->context->employee)) {
+            $this->context->employee = new Employee();
+        }
+
+        $page = (int)Tools::getValue('page');
+        if ($page < 1) {
+            $page = 1;
+        }
+
+        $limit = (int)Tools::getValue('per_page');
+        if ($limit < 1) {
+            $limit = self::CATALOG_PER_PAGE_DEFAULT;
+        }
+        if ($limit > self::CATALOG_PER_PAGE_MAX) {
+            $limit = self::CATALOG_PER_PAGE_MAX;
+        }
+
+        $offset = ($page - 1) * $limit;
+        $with_tax = (Tools::getValue('with_tax') === '0' ? false : true);
+
+        /* El FROM y el WHERE se generan una sola vez y se reutilizan en la query de datos y en la de
+           COUNT, para que el total y el listado no puedan desincronizarse */
+        $from = $this->getProductsSqlFrom($id_lang, $id_shop);
+        $where = $this->getProductsSqlFilters();
+
+        $sql = $this->getProductsSqlSelect($id_lang, $id_shop) . $from . '
+                WHERE 1 ' . $where . '
+                ORDER BY ' . $this->getProductsSqlOrder() . '
+                LIMIT ' . (int)$offset . ', ' . (int)$limit;
+
+        $this->catalog_debug_sql = $sql;
+
+        $rows = Db::getInstance(_PS_USE_SQL_SLAVE_)->executeS($sql);
+
+        /* En producción un SQL erróneo devuelve false sin lanzar excepción y el listado saldría vacío */
+        if ($rows === false && $this->catalog_debug) {
+            $this->exitCatalogDebug(array(
+                'type' => 'SQL error',
+                'message' => Db::getInstance()->getMsgError(),
+                'code' => Db::getInstance()->getNumberError(),
+            ));
+        }
+
+        $count = (int)Db::getInstance(_PS_USE_SQL_SLAVE_)->getValue(
+            'SELECT COUNT(*) ' . $from . ' WHERE 1 ' . $where
+        );
+
+        $products = array();
+        if (is_array($rows)) {
+            foreach ($rows as $row) {
+                if ($this->catalog_debug) {
+                    /* Deja rastro de la última fila procesada: si un producto concreto provoca un
+                       fatal no capturable, el shutdown handler dirá cuál */
+                    $this->catalog_debug_row = 'id_product=' . (int)$row['id_product']
+                        . ' id_product_attribute=' . (int)$row['id_product_attribute'];
+                }
+                $products[] = $this->formatProductRow($row, $id_lang, $id_shop, $with_tax);
+            }
+        }
+
+        $data = array(
+            'products' => $products,
+            'paging' => array(
+                'total' => $count,
+                'pages' => (int)ceil($count / $limit),
+                'currentPage' => $page,
+                'perPage' => $limit,
+            ),
+        );
+
+        $json = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            $this->setError('Cannot encode catalog payload - ' . json_last_error_msg(), 500);
+        }
+
+        $this->controllerSetRespondeHeaders();
+        header('Total-Records: ' . $count);
+        exit($json);
+    }
+
+    /**
+     * Modo diagnóstico del endpoint de catálogo (debug=1). Solo es alcanzable con credenciales
+     * válidas, porque authorizeRequest() se ejecuta antes.
+     *
+     * No envuelve la ejecución en try/catch: instala manejadores globales, de modo que el camino
+     * normal del código no cambia en absoluto cuando el diagnóstico está desactivado.
+     */
+    public function enableCatalogDebug()
+    {
+        $this->catalog_debug = true;
+
+        /* Los errores se devuelven en el JSON, nunca impresos en medio de la respuesta */
+        @ini_set('display_errors', 0);
+
+        set_exception_handler(array($this, 'catalogDebugException'));
+        /* Captura lo que un try/catch no puede: agotamiento de memoria o de tiempo */
+        register_shutdown_function(array($this, 'catalogDebugShutdown'));
+    }
+
+    public function catalogDebugException($exception)
+    {
+        $this->handleCatalogError($exception);
+    }
+
+    /**
+     * Registra siempre el error en los logs de PrestaShop (Parámetros avanzados -> Logs), de modo que
+     * quede rastro aunque la respuesta HTTP no llegue a mostrarse, y lo devuelve en JSON.
+     */
+    public function handleCatalogError($exception)
+    {
+        $detail = array(
+            'type' => get_class($exception),
+            'message' => $exception->getMessage(),
+            'file' => $exception->getFile() . ':' . $exception->getLine(),
+            'trace' => explode("\n", $exception->getTraceAsString()),
+        );
+
+        $this->exitCatalogDebug($detail);
+    }
+
+    /**
+     * Respuesta mínima que confirma que la ruta, el controlador y la autenticación funcionan
+     * sin llegar a consultar el catálogo (parámetro ping=1).
+     */
+    public function exitCatalogPing()
+    {
+        $this->controllerSetRespondeHeaders();
+
+        exit(json_encode(array(
+            'ping' => 'ok',
+            'module' => $this->name,
+            'moduleVersion' => $this->version,
+            'psVersion' => _PS_VERSION_,
+            'phpVersion' => phpversion(),
+            'idShop' => (int)$this->context_id_shop,
+            'contextShop' => (isset($this->context->shop) ? (int)$this->context->shop->id : null),
+            'contextLang' => (isset($this->context->language) ? (int)$this->context->language->id : null),
+            'memoryLimit' => ini_get('memory_limit'),
+            'maxExecutionTime' => ini_get('max_execution_time'),
+        ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+
+    public function catalogDebugShutdown()
+    {
+        $error = error_get_last();
+        $fatal = array(E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR);
+
+        /* En una respuesta correcta ya se ha hecho exit() con el JSON y aquí no hay error fatal */
+        if (!$error || !in_array($error['type'], $fatal)) {
+            return;
+        }
+
+        $this->exitCatalogDebug(array(
+            'type' => 'PHP Fatal error',
+            'message' => $error['message'],
+            'file' => $error['file'] . ':' . $error['line'],
+        ));
+    }
+
+    protected function exitCatalogDebug($error)
+    {
+        /* El error de SQL no trae fichero ni traza */
+        $error = array_merge(array('type' => 'unknown', 'message' => '', 'file' => ''), $error);
+
+        $error['lastSql'] = $this->catalog_debug_sql;
+        $error['lastRow'] = $this->catalog_debug_row;
+        $error['psVersion'] = _PS_VERSION_;
+        $error['phpVersion'] = phpversion();
+        $error['memoryLimit'] = ini_get('memory_limit');
+        $error['memoryPeak'] = round(memory_get_peak_usage(true) / 1048576, 1) . ' MB';
+        $error['maxExecutionTime'] = ini_get('max_execution_time');
+
+        /* Se registra siempre, con o sin debug: si PrestaShop intercepta la respuesta y muestra su
+           página 500, el error queda igualmente en Parámetros avanzados -> Logs */
+        PrestaShopLogger::addLog(
+            'ICOMMKTCONNECTOR - CATALOG: ' . $error['type'] . ' - ' . $error['message']
+            . ' @ ' . $error['file'] . ' - lastRow: ' . $error['lastRow'],
+            3
+        );
+
+        $this->controllerSetRespondeHeaders();
+        header('HTTP/1.1 500 Internal Server Error');
+
+        exit(json_encode(array('error' => $error), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+
+    /**
+     * Joins que definen la cardinalidad del resultado: una fila por SKU real.
+     * Un producto con N combinaciones produce N filas; uno sin combinaciones, una sola.
+     */
+    protected function getProductsSqlFrom($id_lang, $id_shop)
+    {
+        return ' FROM `' . _DB_PREFIX_ . 'product` p
+                INNER JOIN `' . _DB_PREFIX_ . 'product_shop` ps
+                    ON (ps.`id_product` = p.`id_product` AND ps.`id_shop` = ' . (int)$id_shop . ')
+                INNER JOIN `' . _DB_PREFIX_ . 'product_lang` pl
+                    ON (pl.`id_product` = p.`id_product`
+                        AND pl.`id_lang` = ' . (int)$id_lang . '
+                        AND pl.`id_shop` = ' . (int)$id_shop . ')
+                LEFT JOIN `' . _DB_PREFIX_ . 'product_attribute` pa
+                    ON (pa.`id_product` = p.`id_product`)
+                LEFT JOIN `' . _DB_PREFIX_ . 'product_attribute_shop` pas
+                    ON (pas.`id_product_attribute` = pa.`id_product_attribute`
+                        AND pas.`id_shop` = ' . (int)$id_shop . ')
+                LEFT JOIN `' . _DB_PREFIX_ . 'manufacturer` m
+                    ON (m.`id_manufacturer` = p.`id_manufacturer`)
+                LEFT JOIN `' . _DB_PREFIX_ . 'category_lang` cl
+                    ON (cl.`id_category` = p.`id_category_default`
+                        AND cl.`id_lang` = ' . (int)$id_lang . '
+                        AND cl.`id_shop` = ' . (int)$id_shop . ')';
+    }
+
+    /**
+     * Stock, imagen y nombre de la combinación van como subconsultas escalares (no como joins) para
+     * no alterar la cardinalidad: MySQL solo las evalúa para las filas que sobreviven al LIMIT.
+     */
+    protected function getProductsSqlSelect($id_lang, $id_shop)
+    {
+        $stock_restriction = StockAvailable::addSqlShopRestriction(null, (int)$id_shop, 'sa');
+
+        return 'SELECT
+                p.`id_product`,
+                IFNULL(pa.`id_product_attribute`, 0) AS `id_product_attribute`,
+                IFNULL(NULLIF(pa.`reference`, \'\'), p.`reference`) AS `sku_reference`,
+                IFNULL(NULLIF(pa.`ean13`, \'\'), p.`ean13`) AS `sku_ean13`,
+                IFNULL(NULLIF(pa.`upc`, \'\'), p.`upc`) AS `sku_upc`,
+                p.`date_add`, p.`date_upd`,
+                (p.`weight` + IFNULL(pa.`weight`, 0)) AS `sku_weight`,
+                ps.`active`, ps.`visibility`,
+                (ps.`price` + IFNULL(pas.`price`, 0)) AS `base_price`,
+                pl.`name`, pl.`link_rewrite`, pl.`description_short`,
+                m.`name` AS `manufacturer_name`,
+                cl.`name` AS `category_name`, cl.`link_rewrite` AS `category_link_rewrite`,
+                (SELECT sa.`quantity`
+                    FROM `' . _DB_PREFIX_ . 'stock_available` sa
+                    WHERE sa.`id_product` = p.`id_product`
+                        AND sa.`id_product_attribute` = IFNULL(pa.`id_product_attribute`, 0)
+                        ' . $stock_restriction . '
+                    LIMIT 1) AS `quantity`,
+                (SELECT pai.`id_image`
+                    FROM `' . _DB_PREFIX_ . 'product_attribute_image` pai
+                    WHERE pai.`id_product_attribute` = pa.`id_product_attribute`
+                    ORDER BY pai.`id_image` ASC LIMIT 1) AS `id_image_attribute`,
+                (SELECT ims.`id_image`
+                    FROM `' . _DB_PREFIX_ . 'image_shop` ims
+                    WHERE ims.`id_product` = p.`id_product`
+                        AND ims.`id_shop` = ' . (int)$id_shop . '
+                        AND ims.`cover` = 1
+                    LIMIT 1) AS `id_image_cover`,
+                (SELECT GROUP_CONCAT(CONCAT(agl.`name`, \': \', al.`name`)
+                            ORDER BY ag.`position` ASC SEPARATOR \', \')
+                    FROM `' . _DB_PREFIX_ . 'product_attribute_combination` pac
+                    INNER JOIN `' . _DB_PREFIX_ . 'attribute` a
+                        ON (a.`id_attribute` = pac.`id_attribute`)
+                    INNER JOIN `' . _DB_PREFIX_ . 'attribute_group` ag
+                        ON (ag.`id_attribute_group` = a.`id_attribute_group`)
+                    INNER JOIN `' . _DB_PREFIX_ . 'attribute_lang` al
+                        ON (al.`id_attribute` = a.`id_attribute` AND al.`id_lang` = ' . (int)$id_lang . ')
+                    INNER JOIN `' . _DB_PREFIX_ . 'attribute_group_lang` agl
+                        ON (agl.`id_attribute_group` = ag.`id_attribute_group`
+                            AND agl.`id_lang` = ' . (int)$id_lang . ')
+                    WHERE pac.`id_product_attribute` = pa.`id_product_attribute`) AS `combination_name`';
+    }
+
+    protected function getProductsSqlFilters()
+    {
+        $where = '';
+
+        if ($id_product = (int)Tools::getValue('id_product')) {
+            $where .= ' AND p.`id_product` = ' . (int)$id_product;
+        }
+
+        if ($sku = Tools::getValue('sku')) {
+            $sku = $this->escapeLikeValue($sku);
+            $where .= ' AND (p.`reference` LIKE \'%' . $sku . '%\'
+                        OR pa.`reference` LIKE \'%' . $sku . '%\'
+                        OR p.`ean13` LIKE \'%' . $sku . '%\'
+                        OR pa.`ean13` LIKE \'%' . $sku . '%\'
+                        OR p.`upc` LIKE \'%' . $sku . '%\'
+                        OR pa.`upc` LIKE \'%' . $sku . '%\')';
+        }
+
+        if ($name = Tools::getValue('name')) {
+            $where .= ' AND pl.`name` LIKE \'%' . $this->escapeLikeValue($name) . '%\'';
+        }
+
+        if ($search = Tools::getValue('search')) {
+            $like = $this->escapeLikeValue($search);
+            $where .= ' AND (pl.`name` LIKE \'%' . $like . '%\'
+                        OR p.`reference` LIKE \'%' . $like . '%\'
+                        OR pa.`reference` LIKE \'%' . $like . '%\'
+                        OR p.`ean13` LIKE \'%' . $like . '%\'
+                        OR pa.`ean13` LIKE \'%' . $like . '%\'';
+            if (Validate::isUnsignedId($search)) {
+                $where .= ' OR p.`id_product` = ' . (int)$search;
+            }
+            $where .= ')';
+        }
+
+        $active = Tools::getValue('active');
+        if ($active !== false && $active !== '') {
+            $where .= ' AND ps.`active` = ' . ((int)$active ? 1 : 0);
+        }
+
+        if ($updated_since = Tools::getValue('updated_since')) {
+            $timestamp = strtotime($updated_since);
+            if ($timestamp) {
+                $where .= ' AND p.`date_upd` >= \'' . pSQL(date('Y-m-d H:i:s', $timestamp)) . '\'';
+            }
+        }
+
+        /* Descarta combinaciones no asociadas a esta tienda sin perder los productos sin combinaciones */
+        $where .= ' AND (pa.`id_product_attribute` IS NULL OR pas.`id_product_attribute` IS NOT NULL)';
+
+        if (Tools::version_compare(_PS_VERSION_, '1.7.0.0', '>=') == true) {
+            /* 1.7 marca con state = 0 los productos en borrador; en 1.6 la columna no existe */
+            $where .= ' AND p.`state` = 1';
+        }
+
+        return $where;
+    }
+
+    protected function getProductsSqlOrder()
+    {
+        $field = 'p.`id_product`';
+        $way = 'ASC';
+
+        if ($orderBy = Tools::getValue('orderBy')) {
+            $orderParams = explode(',', $orderBy);
+
+            switch ($orderParams[0]) {
+                case 'reference':
+                    $field = '`sku_reference`';
+                    break;
+                case 'name':
+                    $field = 'pl.`name`';
+                    break;
+                case 'price':
+                    $field = '`base_price`';
+                    break;
+                case 'quantity':
+                    $field = '`quantity`';
+                    break;
+                case 'dateUpdated':
+                    $field = 'p.`date_upd`';
+                    break;
+                case 'id':
+                default:
+                    $field = 'p.`id_product`';
+                    break;
+            }
+
+            if (isset($orderParams[1]) && Tools::strtolower(trim($orderParams[1])) == 'desc') {
+                $way = 'DESC';
+            }
+        }
+
+        /* Desempate obligatorio: sin él la paginación puede repetir o perder filas */
+        return $field . ' ' . $way . ', p.`id_product` ASC, IFNULL(pa.`id_product_attribute`, 0) ASC';
+    }
+
+    /**
+     * pSQL() primero y después los comodines: al revés, pSQL() duplicaría la contrabarra
+     * y MySQL interpretaría contrabarra literal + comodín.
+     */
+    protected function escapeLikeValue($value)
+    {
+        return str_replace(array('%', '_'), array('\\%', '\\_'), pSQL(trim($value)));
+    }
+
+    /**
+     * 1.6 expone ImageType::getFormatedName() (una sola "t") y 1.7 getFormattedName().
+     * method_exists es más fiable que comparar versiones: 1.7.0-1.7.5 mantuvieron el alias.
+     */
+    protected function getCatalogImageType()
+    {
+        if (method_exists('ImageType', 'getFormattedName')) {
+            return ImageType::getFormattedName('large');
+        }
+
+        return ImageType::getFormatedName('large');
+    }
+
+    /**
+     * $usereduc a false devuelve el precio sin descuentos aplicados (listPrice).
+     *
+     * El cálculo de precios de PrestaShop depende de mucho contexto y puede fallar para un producto
+     * concreto; un catálogo completo no debe caerse por eso, así que se cae al precio base de la
+     * consulta dejando rastro en los logs.
+     */
+    protected function getCatalogPrice($id_product, $ipa, $with_tax, $usereduc, $row)
+    {
+        try {
+            return (float)Product::getPriceStatic($id_product, $with_tax, $ipa, 2, null, false, $usereduc);
+        } catch (Exception $e) {
+            PrestaShopLogger::addLog(
+                'ICOMMKTCONNECTOR - CATALOG: precio de respaldo para id_product=' . (int)$id_product
+                . ' (' . $e->getMessage() . ')',
+                2
+            );
+
+            return round((float)$row['base_price'], 2);
+        }
+    }
+
+    protected function formatProductRow($row, $id_lang, $id_shop, $with_tax)
+    {
+        $id_product = (int)$row['id_product'];
+        $id_product_attribute = (int)$row['id_product_attribute'];
+        $ipa = ($id_product_attribute ? $id_product_attribute : null);
+
+        $link = $this->context->link;
+        if (!$link) {
+            $link = new Link();
+        }
+
+        /* La imagen de la combinación tiene prioridad sobre la portada del producto */
+        $id_image = (int)$row['id_image_attribute'];
+        if (!$id_image) {
+            $id_image = (int)$row['id_image_cover'];
+        }
+
+        $image_url = null;
+        if ($id_image) {
+            $image_url = $link->getImageLink(
+                $row['link_rewrite'],
+                $id_product . '-' . $id_image,
+                $this->getCatalogImageType()
+            );
+        }
+
+        $combination_name = ($row['combination_name'] ? $row['combination_name'] : null);
+        $quantity = (int)$row['quantity'];
+
+        return array(
+            'sku' => (string)$id_product . ($id_product_attribute ? '-' . $id_product_attribute : ''),
+            'idProduct' => $id_product,
+            'idProductAttribute' => $id_product_attribute,
+            'reference' => $row['sku_reference'],
+            'ean13' => $row['sku_ean13'],
+            'upc' => $row['sku_upc'],
+            'name' => $row['name'],
+            'combinationName' => $combination_name,
+            'fullName' => $row['name'] . ($combination_name ? ' - ' . $combination_name : ''),
+            'descriptionShort' => Tools::substr(strip_tags((string)$row['description_short']), 0, 500),
+            'price' => $this->getCatalogPrice($id_product, $ipa, $with_tax, true, $row),
+            'listPrice' => $this->getCatalogPrice($id_product, $ipa, $with_tax, false, $row),
+            'basePriceTaxExcl' => (float)$row['base_price'],
+            'priceIncludesTax' => (bool)$with_tax,
+            'currency' => $this->context->currency->iso_code,
+            'quantity' => $quantity,
+            'available' => ($quantity > 0),
+            'active' => (bool)$row['active'],
+            'visibility' => $row['visibility'],
+            'manufacturer' => ($row['manufacturer_name'] ? $row['manufacturer_name'] : null),
+            'category' => ($row['category_name'] ? $row['category_name'] : null),
+            'weight' => (float)$row['sku_weight'],
+            /* Se le pasan todos los campos para que Link no instancie un Product por fila */
+            'url' => $link->getProductLink(
+                $id_product,
+                $row['link_rewrite'],
+                $row['category_link_rewrite'],
+                $row['sku_ean13'],
+                (int)$id_lang,
+                (int)$id_shop,
+                $id_product_attribute
+            ),
+            'imageUrl' => $image_url,
+            'dateAdd' => gmdate('c', strtotime($row['date_add'])),
+            'dateUpd' => gmdate('c', strtotime($row['date_upd'])),
+        );
+    }
+
     public function sanitizeWhereParams($where)
     {
         return (str_replace(array("'", '"'), array("''", '""'), $where));
@@ -1248,22 +1914,4 @@ class Icommktconnector extends Module
         return $url;
     }
 
-    public function getFormattedLinkUser($params)
-    {
-        $base_url = Tools::getHttpHost(true);
-
-        $url = $base_url . '/index.php?fc=module&controller=sendtoicommkt&module=icommktconnector&';
-
-        $url_end = '';
-        foreach ($params as $key => $param) {
-            $url_end .= $key . '=' . $param;
-            if (next($params)) {
-                $url_end .= '&';
-            }
-        }
-
-        $url = $url . $url_end;
-
-        return $url;
-    }
 }

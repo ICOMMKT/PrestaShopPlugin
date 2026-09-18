@@ -27,6 +27,13 @@ class IcommktconnectorSendToIcommktModuleFrontController extends ModuleFrontCont
 
     public function init()
     {
+        /* Funcionalidad retirada en la versión 1.4.0: solo sigue disponible en las tiendas
+           que ya la tenían en uso */
+        $module = Module::getInstanceByName('icommktconnector');
+        if (!$module->isNewsletterLegacy()) {
+            Tools::redirect('index.php?controller=404');
+        }
+
         parent::init();
 
         $action = Tools::getValue('action');
